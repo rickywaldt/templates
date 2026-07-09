@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SUPPORT_LEVEL="${SUPPORT_LEVEL:-Standard}"
+USAGE="${USAGE:-Development/Test}"
+SERVICE_LEVEL="${SERVICE_LEVEL:-L1-L3}"
+SYSTEM_UNITS="${SYSTEM_UNITS:-Cores/vCPU}"
+OCM_API="https://api.openshift.com"
+SSO_TOKEN_URL="https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+
+if [[ -z "${OCM_TOKEN:-}" ]]; then
+  echo "ERROR: OCM_TOKEN is not set" >&2
+  exit 1
+fi
+
+echo "Exchanging OCM_TOKEN for an access token..."
+ACCESS_TOKEN=$(curl -fsS "$SSO_TOKEN_URL" \
+  -d grant_type=refresh_token \
+  -d client_id=cloud-services \
+  -d refresh_token="${OCM_TOKEN}" | jq -r '.access_token')
+
+if [[ -z "${ACCESS_TOKEN}" || "${ACCESS_TOKEN}" == "null" ]]; then
+  echo "ERROR: failed to obtain access token" >&2
+  exit 1
+fi
+
+echo "Fetching cluster UUID..."
+CLUSTER_UUID=$(oc get clusterversion version -o jsonpath='{.spec.clusterID}')
+if [[ -z "${CLUSTER_UUID}" ]]; then
+  echo "ERROR: could not determine cluster UUID" >&2
+  exit 1
+fi
+echo "Cluster UUID: ${CLUSTER_UUID}"
+
+echo "Looking up OCM subscription ID..."
+CID=$(curl -fsS -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  --get --data-urlencode "search=external_cluster_id='${CLUSTER_UUID}'" \
+  "${OCM_API}/api/accounts_mgmt/v1/subscriptions" | jq -r '.items[0].href')
+
+if [[ -z "${CID}" || "${CID}" == "null" ]]; then
+  echo "ERROR: no subscription found for cluster ${CLUSTER_UUID}" >&2
+  exit 1
+fi
+echo "Subscription href: ${CID}"
+
+echo "Patching subscription..."
+PATCH_PAYLOAD=$(jq -n \
+  --arg support_level "$SUPPORT_LEVEL" \
+  --arg usage "$USAGE" \
+  --arg service_level "$SERVICE_LEVEL" \
+  --arg system_units "$SYSTEM_UNITS" \
+  '{support_level:$support_level, usage:$usage, service_level:$service_level, system_units:$system_units}')
+
+curl -fsS -X PATCH -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "${PATCH_PAYLOAD}" \
+  "${OCM_API}${CID}"
+
+echo "Subscription updated successfully."
